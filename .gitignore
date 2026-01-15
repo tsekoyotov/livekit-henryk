@@ -14,3 +14,4 @@ src/agent2.py
 src/non_telnyx_agent.py
 livekit.toml
 .github
+.cursor/
