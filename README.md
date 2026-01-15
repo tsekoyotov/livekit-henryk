@@ -14,6 +14,7 @@ A voice AI agent powered by xAI's Grok Voice API for real-time speech-to-speech 
 - **Variable Substitution**: Supports `{{current_time}}` and `{{timezone}}` in prompts
 - **Call Management**: Built-in `hang_up` tool for graceful call termination
 - **Docker Ready**: Includes Dockerfile and docker-compose.yml
+- **LiveKit Cloud Deployment**: Deploy agent directly to LiveKit Cloud with auto-scaling
 
 ## Prerequisites
 
@@ -71,6 +72,84 @@ Then either:
 - **Option A**: Open the `meet_url` directly in your browser
 - **Option B**: Go to [meet.livekit.io](https://meet.livekit.io), paste URL + Token
 
+## LiveKit Cloud Deployment
+
+Deploy the agent to LiveKit Cloud for managed hosting with auto-scaling. The control service stays local.
+
+### Architecture
+
+| Component | Deployment | Description |
+|-----------|------------|-------------|
+| Agent | LiveKit Cloud | xAI Grok voice agent (auto-scaled) |
+| Control | Local Docker | Webhooks, transcription, room creation |
+
+### Step 1: Install LiveKit CLI
+
+```bash
+curl -sSL https://get.livekit.io/cli | bash
+```
+
+### Step 2: Authenticate with LiveKit Cloud
+
+```bash
+lk cloud auth
+```
+
+This opens a browser to authenticate and link your project.
+
+### Step 3: Create Secrets File
+
+Create `.env.livekit-cloud` with agent secrets (LIVEKIT_* vars are auto-injected):
+
+```bash
+XAI_API_KEY=your_xai_api_key
+AGENT_TIMEZONE=UTC
+STORAGE_ACCESS_KEY=your_supabase_s3_access_key
+STORAGE_SECRET=your_supabase_s3_secret
+STORAGE_BUCKET=Recordings
+STORAGE_ENDPOINT=https://your-project.supabase.co/storage/v1/s3
+STORAGE_REGION=eu-north-1
+```
+
+### Step 4: Deploy Agent
+
+```bash
+# First deployment
+lk agent create --secrets-file=.env.livekit-cloud
+
+# Subsequent deployments
+lk agent deploy
+```
+
+### Step 5: Run Control Service Locally
+
+```bash
+docker compose up -d control
+```
+
+### Step 6: Verify
+
+```bash
+# Check agent status
+lk agent status
+
+# View logs
+lk agent logs --follow
+
+# Test call
+./call
+```
+
+### Updating the Agent
+
+```bash
+# Deploy code changes
+lk agent deploy
+
+# Update secrets only
+lk agent update-secrets --secrets-file=.env.livekit-cloud
+```
+
 ## Project Structure
 
 ```
@@ -85,8 +164,9 @@ Then either:
 ├── call                   # Browser test call script
 ├── dial                   # Phone dialing script
 ├── docker-compose.yml     # Docker configuration
-├── Dockerfile
+├── Dockerfile             # Agent container (LiveKit Cloud compatible)
 ├── pyproject.toml
+├── livekit.toml           # LiveKit Cloud config (auto-generated, not committed)
 └── .env                   # API keys (not committed)
 ```
 
@@ -94,8 +174,8 @@ Then either:
 
 | Service | Container | Port | Description |
 |---------|-----------|------|-------------|
-| Agent | Livekit-Henryk | - | xAI Grok voice agent |
-| Control | Livekit-Henryk-Control | 9001 | Room creation & JWT tokens |
+| Agent | Livekit-Henryk | - | xAI Grok voice agent (or deploy to LiveKit Cloud) |
+| Control | Livekit-Henryk-Control | 9001 | Room creation, JWT tokens, webhooks, transcription |
 
 ## Testing the Agent
 
