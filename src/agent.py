@@ -21,6 +21,7 @@ from livekit.plugins.xai.realtime import (
     RealtimeModel,
     WebSearch,
 )  # Using xAI plugin for Grok Voice API
+from prompt_loader import get_system_prompt
 
 logger = logging.getLogger("xai-telephony-agent")
 
@@ -56,22 +57,13 @@ class Assistant(Agent):
     """Agent class that provides tools and instructions for the xAI RealtimeModel."""
 
     def __init__(self, time_str: str, timezone: str) -> None:
-        # Instructions for Rachel's personality - following xAI plugin examples
-        instructions = f"""You are playful & mischievous and on a phone call, your name is Rachel.
-Your responses should be conversational and without any complex formatting or punctuation
-including emojis, asterisks, or other symbols.
-When the user says goodbye or wants to end the call, use the hang_up tool.
-Keep the responses short (under like 60 words).
-You're allowed to speak other languages, especially Polish, Spanish & German.
-You may insert things like [laughter], [whisper] during correct moments in the conversation.
-
-IMPORTANT: The current date and time is {time_str} ({timezone}).
-Use this information when the user asks about the time, date, or anything time-related."""
+        # Load instructions from Agent_prompt.md via prompt_loader
+        instructions = get_system_prompt(time_str, timezone)
 
         # Following xAI plugin examples - instructions go in Agent, not ChatContext
         super().__init__(instructions=instructions)
         logger.info(
-            f"✅ Agent initialized with Rachel instructions (length: {len(instructions)})"
+            f"✅ Agent initialized with instructions from Agent_prompt.md (length: {len(instructions)})"
         )
 
     # Removed custom search_web tool - using xAI's built-in WebSearch tool
@@ -171,20 +163,7 @@ async def entrypoint(ctx: JobContext):
     if egress_id:
         logger.info(f"Call recording to S3: s3://{S3_BUCKET}/calls/{ctx.room.name}.mp3")
 
-    # System instructions - passed via ChatContext
-    system_instructions = f"""You are playful & mischievous and on a phone call, your name is Rachel.
-Your responses should be conversational and without any complex formatting or punctuation 
-including emojis, asterisks, or other symbols.
-When the user says goodbye or wants to end the call, use the hang_up tool.
-When the user asks about current events, news, weather, time or recent information, use the search_web tool.
-Keep the responses short (under like 60 words).
-You're allowed to speak other languages, especially Polish, Spanish & German.
-You may insert things like [laughter], [whisper] during correct moments in the conversation.
-
-IMPORTANT: The current date and time is {time_str} ({timezone_name}).
-Use this information when the user asks about the time, date, or anything time-related."""
-
-    # Use xAI RealtimeModel - proper support for Grok Voice API and instructions
+    # Use xAI RealtimeModel - instructions loaded via Agent class from Agent_prompt.md
     model = RealtimeModel(
         voice="eve",  # xAI voice: Ara, Rex, Sal, Eve, Leo
         api_key=os.getenv("XAI_API_KEY"),
@@ -194,32 +173,42 @@ Use this information when the user asks about the time, date, or anything time-r
     # Create session with xAI RealtimeModel
     session = AgentSession(llm=model)
 
-    # Start session with Agent - xAI plugin handles instructions properly
+    # Add event listeners for debugging
+    @session.on("user_started_speaking")
+    def on_user_started():
+        logger.info("🎤 User started speaking")
+
+    @session.on("user_stopped_speaking")
+    def on_user_stopped():
+        logger.info("🎤 User stopped speaking")
+
+    @session.on("agent_started_speaking")
+    def on_agent_started():
+        logger.info("🔊 Agent started speaking")
+
+    @session.on("agent_stopped_speaking")
+    def on_agent_stopped():
+        logger.info("🔊 Agent stopped speaking")
+
+    # Start session with Agent - instructions come from Agent class
     agent = Assistant(time_str=time_str, timezone=timezone_name)
     await session.start(
         room=ctx.room,
         agent=agent,
     )
+    logger.info("✅ Session started")
 
-    # Ensure instructions are set on the realtime session
+    # Update instructions on the realtime session (workaround for xAI plugin)
     try:
-        await agent.realtime_llm_session.update_instructions(agent.instructions)
-        logger.info(
-            f"✅ Realtime session updated with Rachel instructions (length: {len(agent.instructions)})"
-        )
+        await session.llm.update_instructions(agent.instructions)
+        logger.info(f"✅ Instructions sent to xAI model (length: {len(agent.instructions)})")
     except Exception as e:
-        logger.error(f"❌ Failed to update realtime instructions: {e}")
-        logger.info("Agent may still work but might not have full Rachel personality")
+        logger.warning(f"Could not update instructions: {e}")
 
-    logger.info("✅ xAI RealtimeModel started with Rachel instructions")
-
-    # Greet - using Agent's default Rachel personality
-    try:
-        await session.generate_reply()
-    except Exception as e:
-        logger.warning(
-            f"Initial greeting failed: {e} - waiting for user to speak first"
-        )
+    # Generate initial greeting
+    logger.info("Generating initial greeting...")
+    await session.generate_reply()
+    logger.info("✅ Initial greeting sent - waiting for user response")
 
 
 if __name__ == "__main__":

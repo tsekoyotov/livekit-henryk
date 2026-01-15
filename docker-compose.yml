@@ -1,0 +1,22 @@
+services:
+  livekit-henryk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: Livekit-Henryk
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  control:
+    build:
+      context: ./control
+      dockerfile: Dockerfile
+    container_name: Livekit-Henryk-Control
+    ports:
+      - "9001:9000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - livekit-henryk
