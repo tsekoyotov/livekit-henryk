@@ -20,7 +20,7 @@ from livekit.agents import (
 )
 from livekit.api.egress_service import EgressService
 from livekit.api import RoomCompositeEgressRequest, EncodedFileOutput, S3Upload
-from livekit.protocol.egress import AudioMixing, EgressStatus
+from livekit.protocol.egress import AudioMixing, EgressStatus, StopEgressRequest
 from livekit.plugins.xai.realtime import (
     RealtimeModel,
     WebSearch,
@@ -196,6 +196,8 @@ async def entrypoint(ctx: JobContext):
     # Track greeting and recording state (dict allows modification in nested functions)
     greeting_said = {"value": False}
     egress_started = {"value": False}
+    egress_stopped = {"value": False}
+    current_egress_id = {"value": None}
 
     async def greet_participant():
         """Generate the initial greeting and start recording."""
@@ -208,11 +210,45 @@ async def entrypoint(ctx: JobContext):
             egress_started["value"] = True
             egress_id = await start_dual_channel_recording(ctx)
             if egress_id:
+                current_egress_id["value"] = egress_id
                 logger.info(f"📼 Recording started - Egress ID: {egress_id}")
 
         logger.info("Generating initial greeting...")
         await session.generate_reply()
         logger.info("✅ Initial greeting sent")
+
+    async def stop_egress_and_cleanup():
+        """Stop egress recording and delete room when participant disconnects."""
+        if egress_stopped["value"]:
+            return
+        egress_stopped["value"] = True
+
+        egress_id = current_egress_id["value"]
+
+        # Stop egress first
+        if egress_id:
+            try:
+                async with aiohttp.ClientSession() as http_session:
+                    egress_service = EgressService(
+                        http_session,
+                        os.environ["LIVEKIT_URL"],
+                        os.environ["LIVEKIT_API_KEY"],
+                        os.environ["LIVEKIT_API_SECRET"],
+                    )
+                    await egress_service.stop_egress(StopEgressRequest(egress_id=egress_id))
+                    logger.info(f"⏹️ Egress stopped - ID: {egress_id}")
+            except Exception as e:
+                logger.error(f"Failed to stop egress: {e}")
+
+        # Small delay to ensure egress stop is processed
+        await asyncio.sleep(0.5)
+
+        # Delete room to force complete cleanup (same as hang_up tool)
+        try:
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+            logger.info(f"🗑️ Room deleted: {ctx.room.name}")
+        except Exception as e:
+            logger.error(f"Failed to delete room: {e}")
 
     # Handler for participant attributes changed (SIP call status updates)
     def on_participant_attributes_changed(changed_attributes: dict, participant: rtc.Participant):
@@ -246,9 +282,16 @@ async def entrypoint(ctx: JobContext):
                 logger.info(f"🌐 Browser participant: {participant.identity} - greeting...")
                 asyncio.create_task(greet_participant())
 
+    # Handler for participant disconnected - stop egress and cleanup room
+    def on_participant_disconnected(participant: rtc.RemoteParticipant):
+        """Stop egress and delete room when participant disconnects."""
+        logger.info(f"👋 Participant disconnected: {participant.identity} - stopping egress and cleaning up")
+        asyncio.create_task(stop_egress_and_cleanup())
+
     # Register event handlers
     ctx.room.on("participant_attributes_changed", on_participant_attributes_changed)
     ctx.room.on("participant_connected", on_participant_connected)
+    ctx.room.on("participant_disconnected", on_participant_disconnected)
 
     # Add event listeners for debugging
     @session.on("user_started_speaking")
