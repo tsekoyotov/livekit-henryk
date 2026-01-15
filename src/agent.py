@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import httpx
+import aiohttp
 from dotenv import load_dotenv
 from livekit import api, agents, rtc
 from livekit.agents import (
@@ -18,6 +18,9 @@ from livekit.agents import (
     get_job_context,
     llm,
 )
+from livekit.api.egress_service import EgressService
+from livekit.api import RoomCompositeEgressRequest, EncodedFileOutput, S3Upload
+from livekit.protocol.egress import AudioMixing, EgressStatus
 from livekit.plugins.xai.realtime import (
     RealtimeModel,
     WebSearch,
@@ -28,16 +31,15 @@ logger = logging.getLogger("xai-telephony-agent")
 
 load_dotenv(".env.local")
 
-# Egress configuration (set in .env.local)
-ENABLE_RECORDING = os.getenv("ENABLE_RECORDING", "false").lower() == "true"
-S3_BUCKET = os.getenv("S3_BUCKET", "")  # Your Supabase bucket name
-S3_REGION = os.getenv("S3_REGION", "eu-central-1")
-S3_ACCESS_KEY = os.getenv("ACCESS_SUPABASE", "")  # Supabase access key
-S3_SECRET_KEY = os.getenv("SECRET_SUPABASE", "")  # Supabase secret key
-S3_ENDPOINT = os.getenv(
-    "ENDPOINT_SUPABASE",
-    "https://rexdoyxjqixzchgaadum.storage.supabase.co/storage/v1/s3",
-)
+# Supabase Cloud Storage configuration (for dual-channel egress)
+STORAGE_ACCESS_KEY = os.getenv("STORAGE_ACCESS_KEY", "")
+STORAGE_SECRET = os.getenv("STORAGE_SECRET", "")
+STORAGE_BUCKET = os.getenv("STORAGE_BUCKET", "Recordings")
+STORAGE_ENDPOINT = os.getenv("STORAGE_ENDPOINT", "")
+STORAGE_REGION = os.getenv("STORAGE_REGION", "eu-north-1")
+
+# Check if recording is configured
+RECORDING_ENABLED = all([STORAGE_ACCESS_KEY, STORAGE_SECRET, STORAGE_BUCKET, STORAGE_ENDPOINT])
 
 # Web search configuration
 EXA_API_KEY = os.getenv("EXA_API_KEY", "")
@@ -88,56 +90,64 @@ class Assistant(Agent):
         return "Call ended successfully"
 
 
-async def start_recording(ctx: JobContext) -> str | None:
-    """Start egress recording for the call."""
-    if not ENABLE_RECORDING:
-        logger.info("Recording disabled - set ENABLE_RECORDING=true to enable")
+async def start_dual_channel_recording(ctx: JobContext) -> str | None:
+    """
+    Start dual-channel egress recording to Supabase Cloud.
+
+    Uses AudioMixing.DUAL_CHANNEL_AGENT:
+    - Left channel (FL): Agent audio
+    - Right channel (FR): Human audio
+
+    This allows post-call transcription of both speakers separately.
+    """
+    if not RECORDING_ENABLED:
+        logger.info("Recording disabled - configure STORAGE_* env vars to enable")
         return None
 
-    logger.info(f"Recording enabled - checking credentials (bucket={S3_BUCKET})")
-
-    if not all([S3_BUCKET, S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY]):
-        logger.warning(
-            f"S3 credentials incomplete: bucket={bool(S3_BUCKET)}, region={bool(S3_REGION)}, access_key={bool(S3_ACCESS_KEY)}, secret_key={bool(S3_SECRET_KEY)}"
-        )
-        return None
+    logger.info(f"Starting dual-channel egress to s3://{STORAGE_BUCKET}/{ctx.room.name}/")
 
     try:
-        # Start audio-only room composite egress
-        logger.info(
-            f"Starting egress recording to s3://{S3_BUCKET}/calls/{ctx.room.name}.mp3"
+        # Configure S3 upload to Supabase Cloud
+        s3_upload = S3Upload(
+            access_key=STORAGE_ACCESS_KEY,
+            secret=STORAGE_SECRET,
+            region=STORAGE_REGION,
+            bucket=STORAGE_BUCKET,
+            endpoint=STORAGE_ENDPOINT,
+            force_path_style=True,
         )
 
-        egress_info = await ctx.api.egress.start_room_composite_egress(
-            api.RoomCompositeEgressRequest(
-                room_name=ctx.room.name,
-                audio_only=True,  # Only record audio
-                file_outputs=[
-                    api.EncodedFileOutput(
-                        filepath=f"calls/{ctx.room.name}.mp3",  # Save as MP3
-                        s3=api.S3Upload(
-                            access_key=S3_ACCESS_KEY,
-                            secret=S3_SECRET_KEY,
-                            bucket=S3_BUCKET,
-                            region=S3_REGION,
-                            endpoint=S3_ENDPOINT,  # Supabase S3 endpoint
-                            force_path_style=True,  # Required for Supabase
-                        ),
-                    )
-                ],
+        # File output configuration (OGG format for better compression)
+        file_output = EncodedFileOutput(
+            file_type=api.EncodedFileType.OGG,
+            filepath=f"{ctx.room.name}/recording-{{time}}.ogg",
+            s3=s3_upload,
+        )
+
+        # Create egress request with dual-channel audio mixing
+        egress_request = RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            audio_only=True,
+            audio_mixing=AudioMixing.DUAL_CHANNEL_AGENT,  # Agent=Left, Human=Right
+            file_outputs=[file_output],
+        )
+
+        # Start egress recording
+        async with aiohttp.ClientSession() as http_session:
+            egress_service = EgressService(
+                http_session,
+                os.environ["LIVEKIT_URL"],
+                os.environ["LIVEKIT_API_KEY"],
+                os.environ["LIVEKIT_API_SECRET"],
             )
-        )
+            egress_info = await egress_service.start_room_composite_egress(egress_request)
 
-        logger.info(
-            f"✅ Recording started successfully - Egress ID: {egress_info.egress_id}"
-        )
-        logger.info(
-            f"📁 File will be saved to: s3://{S3_BUCKET}/calls/{ctx.room.name}.mp3"
-        )
+        logger.info(f"✅ Dual-channel recording started - Egress ID: {egress_info.egress_id}")
+        logger.info(f"📁 Recording to: s3://{STORAGE_BUCKET}/{ctx.room.name}/recording-*.ogg")
         return egress_info.egress_id
 
     except Exception as e:
-        logger.error(f"Failed to start recording: {e}")
+        logger.error(f"Failed to start dual-channel recording: {e}")
         return None
 
 
@@ -173,11 +183,6 @@ async def entrypoint(ctx: JobContext):
         time_str = current_time.strftime("%A, %B %d, %Y at %I:%M %p")
         timezone_name = "UTC"
 
-    # Start recording the call
-    egress_id = await start_recording(ctx)
-    if egress_id:
-        logger.info(f"Call recording to S3: s3://{S3_BUCKET}/calls/{ctx.room.name}.mp3")
-
     # Use xAI RealtimeModel - instructions loaded via Agent class from Agent_prompt.md
     model = RealtimeModel(
         voice="eve",  # xAI voice: Ara, Rex, Sal, Eve, Leo
@@ -188,14 +193,23 @@ async def entrypoint(ctx: JobContext):
     # Create session with xAI RealtimeModel
     session = AgentSession(llm=model)
 
-    # Track greeting state (dict allows modification in nested functions)
+    # Track greeting and recording state (dict allows modification in nested functions)
     greeting_said = {"value": False}
+    egress_started = {"value": False}
 
     async def greet_participant():
-        """Generate the initial greeting."""
+        """Generate the initial greeting and start recording."""
         if greeting_said["value"]:
             return
         greeting_said["value"] = True
+
+        # Start recording when call is answered (not during ringing)
+        if not egress_started["value"]:
+            egress_started["value"] = True
+            egress_id = await start_dual_channel_recording(ctx)
+            if egress_id:
+                logger.info(f"📼 Recording started - Egress ID: {egress_id}")
+
         logger.info("Generating initial greeting...")
         await session.generate_reply()
         logger.info("✅ Initial greeting sent")

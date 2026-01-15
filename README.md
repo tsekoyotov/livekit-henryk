@@ -6,6 +6,9 @@ A voice AI agent powered by xAI's Grok Voice API for real-time speech-to-speech 
 
 - **Speech-to-Speech**: Uses xAI Grok Voice API for natural, audio-to-audio conversations
 - **Phone Calls**: Outbound dialing via LiveKit SIP + Twilio
+- **Dual-Channel Recording**: Records agent (left) and human (right) on separate channels
+- **Auto Transcription**: AssemblyAI transcribes both channels, merged by timestamp
+- **Webhook Integration**: Sends transcript and recording URL to n8n after call ends
 - **Browser Testing**: Test via LiveKit Meet with JWT tokens
 - **External Prompt Loading**: Prompts stored in markdown files for easy editing
 - **Variable Substitution**: Supports `{{current_time}}` and `{{timezone}}` in prompts
@@ -218,7 +221,75 @@ Returns:
        ↓
 6. Agent detects answer (sip.callStatus=active)
        ↓
-7. Rachel greets and conversation begins
+7. Recording starts + Rachel greets
+       ↓
+8. Call ends → Transcription → Webhook to n8n
+```
+
+## Recording & Transcription
+
+Calls are automatically recorded and transcribed when configured.
+
+### Recording Flow
+
+```
+Call Answered (sip.callStatus=active)
+       ↓
+Dual-Channel Recording Starts
+(Agent=Left channel, Human=Right channel)
+       ↓
+Recording → Supabase Cloud S3 (stereo OGG)
+       ↓
+Call Ends → LiveKit sends egress_ended webhook
+       ↓
+Control service downloads recording
+       ↓
+FFmpeg splits channels → AssemblyAI transcribes both
+       ↓
+Transcripts merged by timestamp
+       ↓
+Webhook sent to n8n with transcript + recording URL
+```
+
+### Setup Recording
+
+Add to your `.env`:
+
+```bash
+# Supabase Cloud Storage (S3-compatible)
+STORAGE_ACCESS_KEY=your_supabase_s3_access_key
+STORAGE_SECRET=your_supabase_s3_secret
+STORAGE_BUCKET=Recordings
+STORAGE_ENDPOINT=https://your-project.supabase.co/storage/v1/s3
+STORAGE_REGION=eu-north-1
+
+# AssemblyAI (for transcription)
+ASSEMBLYAI_API_KEY=your_assemblyai_key
+
+# n8n Webhook (receives transcript after call)
+POST_CALL_WEBHOOK_URL=https://your-n8n/webhook/your-id
+```
+
+Configure LiveKit webhook in [cloud.livekit.io](https://cloud.livekit.io):
+- URL: `https://your-control-service/livekit-henryk/webhook`
+- Events: `egress_ended`
+
+### Webhook Payload
+
+After transcription, n8n receives:
+
+```json
+{
+  "room_name": "call_abc123",
+  "phone_number": "+1234567890",
+  "first_name": "John",
+  "recording_url": "https://...supabase.co/.../recording.ogg",
+  "transcript": "AI: Hello...\nHUMAN: Hi...",
+  "transcript_structured": [
+    {"speaker": "ai", "t_start": 0.8, "t_end": 2.1, "text": "Hello..."},
+    {"speaker": "human", "t_start": 2.5, "t_end": 3.2, "text": "Hi..."}
+  ]
+}
 ```
 
 ## Customizing the Agent
@@ -329,7 +400,13 @@ await session.generate_reply()  # Triggers greeting with loaded instructions
 | `LIVEKIT_SIP_TRUNK_ID` | For calls | SIP trunk ID from LiveKit Cloud |
 | `TWILIO_PHONE_NUMBER` | For calls | Your Twilio phone number (caller ID) |
 | `EXA_API_KEY` | No | Exa API key for web search |
-| `ENABLE_RECORDING` | No | Enable S3 recording (default: false) |
+| `STORAGE_ACCESS_KEY` | For recording | Supabase S3 access key |
+| `STORAGE_SECRET` | For recording | Supabase S3 secret |
+| `STORAGE_BUCKET` | For recording | S3 bucket name (default: Recordings) |
+| `STORAGE_ENDPOINT` | For recording | Supabase S3 endpoint URL |
+| `STORAGE_REGION` | For recording | S3 region (default: eu-north-1) |
+| `ASSEMBLYAI_API_KEY` | For transcription | AssemblyAI API key |
+| `POST_CALL_WEBHOOK_URL` | For webhook | n8n webhook URL for transcripts |
 
 ## License
 
