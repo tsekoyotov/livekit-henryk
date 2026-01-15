@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     livekit-api \
+    livekit-protocol \
     aiohttp
 
 # Copy application

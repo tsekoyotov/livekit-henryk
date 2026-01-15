@@ -5,10 +5,11 @@ A voice AI agent powered by xAI's Grok Voice API for real-time speech-to-speech 
 ## Features
 
 - **Speech-to-Speech**: Uses xAI Grok Voice API for natural, audio-to-audio conversations
+- **Phone Calls**: Outbound dialing via LiveKit SIP + Twilio
+- **Browser Testing**: Test via LiveKit Meet with JWT tokens
 - **External Prompt Loading**: Prompts stored in markdown files for easy editing
 - **Variable Substitution**: Supports `{{current_time}}` and `{{timezone}}` in prompts
 - **Call Management**: Built-in `hang_up` tool for graceful call termination
-- **Test Call Script**: Easy testing via `./call` script with JWT token generation
 - **Docker Ready**: Includes Dockerfile and docker-compose.yml
 
 ## Prerequisites
@@ -76,9 +77,10 @@ Then either:
 │   ├── Agent_prompt.md    # Rachel's prompt (edit this!)
 │   └── prompt_loader.py   # Loads prompts with variable substitution
 ├── control/
-│   ├── app.py             # Control service (room/token creation)
+│   ├── app.py             # Control service (room/token/SIP)
 │   └── Dockerfile
-├── call                   # Test call script
+├── call                   # Browser test call script
+├── dial                   # Phone dialing script
 ├── docker-compose.yml     # Docker configuration
 ├── Dockerfile
 ├── pyproject.toml
@@ -138,6 +140,85 @@ Returns:
   "livekit_url": "wss://...",
   "token": "eyJ..."
 }
+```
+
+## Phone Calls (Outbound Dialing)
+
+Make real phone calls to any number using LiveKit SIP + Twilio.
+
+### Prerequisites for Phone Calls
+
+1. **Twilio Account**: Sign up at [twilio.com](https://twilio.com)
+2. **Twilio Phone Number**: Purchase a number (E.164 format: +1234567890)
+3. **Twilio SIP Trunk**: Create in Twilio Console with credentials
+4. **LiveKit Cloud SIP Trunk**: Configure in LiveKit Cloud Console
+   - Go to [cloud.livekit.io](https://cloud.livekit.io) → Your Project → Settings → SIP
+   - Add your Twilio trunk credentials
+   - Copy the `LIVEKIT_SIP_TRUNK_ID` (starts with `ST_`)
+
+### Setup
+
+Add to your `.env`:
+
+```bash
+LIVEKIT_SIP_TRUNK_ID=ST_xxxxxxxxxxxx
+TWILIO_PHONE_NUMBER=+1234567890
+```
+
+Rebuild containers:
+
+```bash
+docker compose up -d --build
+```
+
+### Dialing a Phone Number
+
+Use the `./dial` script:
+
+```bash
+./dial +1234567890 "John"
+```
+
+Or call the API directly:
+
+```bash
+curl -X POST http://localhost:9001/dial-lead \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone_number": "+1234567890",
+    "first_name": "John",
+    "last_name": "Smith",
+    "initial_greeting": true
+  }'
+```
+
+Returns:
+```json
+{
+  "status": "success",
+  "room_name": "call_abc12345",
+  "sip_call_id": "SC_xyz789",
+  "phone_number": "+1234567890",
+  "message": "Dialing +1234567890..."
+}
+```
+
+### Call Flow
+
+```
+1. ./dial +1234567890 "John"
+       ↓
+2. Control service creates LiveKit room
+       ↓
+3. SIP call initiated via LiveKit Cloud
+       ↓
+4. Twilio routes call to PSTN
+       ↓
+5. Phone rings → User answers
+       ↓
+6. Agent detects answer (sip.callStatus=active)
+       ↓
+7. Rachel greets and conversation begins
 ```
 
 ## Customizing the Agent
@@ -229,6 +310,9 @@ await session.generate_reply()  # Triggers greeting with loaded instructions
 | Agent not registered | Check `.env` has correct `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` |
 | Control service not responding | Check port 9001 is available, restart with `docker compose restart control` |
 | `./call` script fails | Ensure control service is running: `docker ps \| grep Control` |
+| `./dial` fails with "SIP trunk not configured" | Set `LIVEKIT_SIP_TRUNK_ID` in `.env` |
+| Phone doesn't ring | Check Twilio SIP trunk credentials, verify trunk is configured in LiveKit Cloud |
+| Agent doesn't greet on phone call | Check agent logs: `docker logs Livekit-Henryk` - look for "SIP call answered" |
 
 ## Environment Variables
 
@@ -242,6 +326,8 @@ await session.generate_reply()  # Triggers greeting with loaded instructions
 | `LIVEKIT_AGENT_NAME` | No | Agent name (default: test_agent) |
 | `XAI_API_KEY` | Yes | xAI API key for Grok Voice |
 | `AGENT_TIMEZONE` | No | IANA timezone (default: UTC) |
+| `LIVEKIT_SIP_TRUNK_ID` | For calls | SIP trunk ID from LiveKit Cloud |
+| `TWILIO_PHONE_NUMBER` | For calls | Your Twilio phone number (caller ID) |
 | `EXA_API_KEY` | No | Exa API key for web search |
 | `ENABLE_RECORDING` | No | Enable S3 recording (default: false) |
 

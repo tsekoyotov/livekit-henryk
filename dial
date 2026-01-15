@@ -1,0 +1,118 @@
+#!/bin/bash
+
+# Dial Script for xAI Grok Voice Agent
+# Dials a phone number and connects to Rachel (xAI Grok)
+
+# Colors
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+PHONE_NUMBER=$1
+FIRST_NAME=${2:-"Caller"}
+LAST_NAME=${3:-""}
+
+echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}   xAI Grok Voice Agent - Phone Dialer${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Show usage if no phone number provided
+if [ -z "$PHONE_NUMBER" ]; then
+    echo -e "${YELLOW}Usage:${NC}"
+    echo "  ./dial +1234567890 [FirstName] [LastName]"
+    echo ""
+    echo -e "${YELLOW}Examples:${NC}"
+    echo "  ./dial +14155551234"
+    echo "  ./dial +14155551234 John"
+    echo "  ./dial +14155551234 John Smith"
+    echo ""
+    echo -e "${YELLOW}Note:${NC}"
+    echo "  Phone number must be in E.164 format (starting with +)"
+    exit 1
+fi
+
+# Validate phone number format
+if [[ ! "$PHONE_NUMBER" =~ ^\+[0-9]+$ ]]; then
+    echo -e "${RED}Error: Phone number must be in E.164 format (+1234567890)${NC}"
+    exit 1
+fi
+
+# Check if control service is running
+if ! docker ps --format '{{.Names}}' | grep -q "Livekit-Henryk-Control"; then
+    echo -e "${RED}Control service is not running${NC}"
+    echo "Start it with: docker compose up -d --build"
+    exit 1
+fi
+
+echo -e "Dialing: ${CYAN}$PHONE_NUMBER${NC}"
+if [ -n "$FIRST_NAME" ]; then
+    echo -e "Name: ${CYAN}$FIRST_NAME $LAST_NAME${NC}"
+fi
+echo ""
+
+# Build JSON payload
+JSON_PAYLOAD=$(cat <<EOF
+{
+    "phone_number": "$PHONE_NUMBER",
+    "first_name": "$FIRST_NAME",
+    "last_name": "$LAST_NAME",
+    "initial_greeting": true
+}
+EOF
+)
+
+# Make request to control service
+RESPONSE=$(curl -s -X POST http://localhost:9001/dial-lead \
+    -H "Content-Type: application/json" \
+    -d "$JSON_PAYLOAD")
+
+# Check response
+if echo "$RESPONSE" | grep -q '"status":"success"'; then
+    echo -e "${GREEN}Call initiated successfully!${NC}"
+    echo ""
+
+    # Extract values
+    ROOM_NAME=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('room_name', 'N/A'))" 2>/dev/null)
+    SIP_CALL_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('sip_call_id', 'N/A'))" 2>/dev/null)
+
+    echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}   Call Details${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "Phone: ${CYAN}$PHONE_NUMBER${NC}"
+    echo -e "Room: ${CYAN}$ROOM_NAME${NC}"
+    echo -e "SIP Call ID: ${CYAN}$SIP_CALL_ID${NC}"
+    echo ""
+    echo -e "${YELLOW}The phone is now ringing...${NC}"
+    echo "When answered, Rachel (xAI Grok) will greet the caller."
+    echo ""
+    echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}   Monitor Logs${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "To watch the call in real-time:"
+    echo "  docker logs -f Livekit-Henryk"
+    echo ""
+else
+    echo -e "${RED}Failed to initiate call${NC}"
+    echo ""
+
+    # Try to extract error message
+    ERROR=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('error', 'Unknown error'))" 2>/dev/null)
+
+    if [ -n "$ERROR" ]; then
+        echo -e "Error: ${RED}$ERROR${NC}"
+    else
+        echo "Response: $RESPONSE"
+    fi
+    echo ""
+    echo "Make sure:"
+    echo "  1. Control service is running: docker compose up -d"
+    echo "  2. LIVEKIT_SIP_TRUNK_ID is set in .env"
+    echo "  3. SIP trunk is configured in LiveKit Cloud"
+    exit 1
+fi

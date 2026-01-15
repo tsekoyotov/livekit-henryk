@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime
@@ -6,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from livekit import api, agents
+from livekit import api, agents, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -145,6 +146,20 @@ async def entrypoint(ctx: JobContext):
 
     logger.info(f"Call started - Room: {ctx.room.name}")
 
+    # Parse room metadata to check if this is a phone call
+    room_metadata = {}
+    try:
+        if ctx.room.metadata:
+            room_metadata = json.loads(ctx.room.metadata)
+    except json.JSONDecodeError:
+        pass
+
+    is_phone_call = room_metadata.get("phone_call", False)
+    initial_greeting_enabled = room_metadata.get("initial_greeting", True)
+    caller_first_name = room_metadata.get("first_name", "")
+
+    logger.info(f"Room metadata: phone_call={is_phone_call}, initial_greeting={initial_greeting_enabled}, first_name={caller_first_name}")
+
     # Get current time in configured timezone
     try:
         tz = ZoneInfo(AGENT_TIMEZONE)
@@ -172,6 +187,54 @@ async def entrypoint(ctx: JobContext):
 
     # Create session with xAI RealtimeModel
     session = AgentSession(llm=model)
+
+    # Track greeting state (dict allows modification in nested functions)
+    greeting_said = {"value": False}
+
+    async def greet_participant():
+        """Generate the initial greeting."""
+        if greeting_said["value"]:
+            return
+        greeting_said["value"] = True
+        logger.info("Generating initial greeting...")
+        await session.generate_reply()
+        logger.info("✅ Initial greeting sent")
+
+    # Handler for participant attributes changed (SIP call status updates)
+    def on_participant_attributes_changed(changed_attributes: dict, participant: rtc.Participant):
+        """Detect when SIP call transitions to 'active' (answered)."""
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            call_status = changed_attributes.get("sip.callStatus", "")
+            logger.info(f"SIP status change: {participant.identity} -> {call_status}")
+
+            if call_status == "active" and not greeting_said["value"] and initial_greeting_enabled:
+                logger.info(f"📞 SIP call answered: {participant.identity}")
+                asyncio.create_task(greet_participant())
+
+    # Handler for participant connected
+    def on_participant_connected(participant: rtc.Participant):
+        """Handle new participant joining the room."""
+        logger.info(f"Participant connected: {participant.identity} (kind={participant.kind})")
+
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            # SIP participant (phone call) - check if already answered
+            call_status = participant.attributes.get("sip.callStatus", "")
+            logger.info(f"SIP participant: {participant.identity}, callStatus={call_status}")
+
+            if call_status == "active" and not greeting_said["value"] and initial_greeting_enabled:
+                logger.info(f"📞 SIP call already active: {participant.identity}")
+                asyncio.create_task(greet_participant())
+            else:
+                logger.info(f"📞 SIP call dialing: {participant.identity} - waiting for answer...")
+        else:
+            # Browser participant - greet immediately
+            if not greeting_said["value"] and initial_greeting_enabled:
+                logger.info(f"🌐 Browser participant: {participant.identity} - greeting...")
+                asyncio.create_task(greet_participant())
+
+    # Register event handlers
+    ctx.room.on("participant_attributes_changed", on_participant_attributes_changed)
+    ctx.room.on("participant_connected", on_participant_connected)
 
     # Add event listeners for debugging
     @session.on("user_started_speaking")
@@ -205,10 +268,21 @@ async def entrypoint(ctx: JobContext):
     except Exception as e:
         logger.warning(f"Could not update instructions: {e}")
 
-    # Generate initial greeting
-    logger.info("Generating initial greeting...")
-    await session.generate_reply()
-    logger.info("✅ Initial greeting sent - waiting for user response")
+    # Check for existing participants (race condition: they may have joined before handlers registered)
+    if initial_greeting_enabled and not greeting_said["value"]:
+        for participant in ctx.room.remote_participants.values():
+            if greeting_said["value"]:
+                break
+
+            if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                call_status = participant.attributes.get("sip.callStatus", "")
+                logger.info(f"Found existing SIP participant: {participant.identity}, callStatus={call_status}")
+                if call_status == "active":
+                    logger.info(f"📞 Existing SIP participant active - greeting...")
+                    asyncio.create_task(greet_participant())
+            else:
+                logger.info(f"Found existing browser participant: {participant.identity} - greeting...")
+                asyncio.create_task(greet_participant())
 
 
 if __name__ == "__main__":
